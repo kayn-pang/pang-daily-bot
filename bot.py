@@ -2,14 +2,17 @@
 """
 Pang's Daily Assistant - Keyword-triggered Telegram Bot
 Commands: /eventday /eventtmr /eventweek /eventnextweek /help
+Features: 30-min event reminders, Calendly booking alerts
 """
 
 import os
 import json
 import time
+import threading
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from flask import Flask, request as flask_request
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -22,6 +25,9 @@ ALLOWED_CHAT_ID = 1527866122
 TELEGRAM_API    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 POLL_INTERVAL   = 2
 TZ              = ZoneInfo("Asia/Kuala_Lumpur")
+
+REMINDER_CHECK_INTERVAL = 300  # check every 5 minutes
+REMINDER_MINUTES_BEFORE = 30   # remind 30 mins before event
 
 BOT_DIR    = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BOT_DIR, "bot_state.json")
@@ -59,7 +65,7 @@ def get_calendar_service():
 def fetch_events(time_min: datetime, time_max: datetime):
     service = get_calendar_service()
     if not service:
-        return None  # Not authorised yet
+        return None
 
     all_events = []
     tmin = time_min.isoformat()
@@ -80,7 +86,6 @@ def fetch_events(time_min: datetime, time_max: datetime):
         except Exception:
             pass
 
-    # Sort by start time
     def sort_key(e):
         start = e.get("start", {})
         return start.get("dateTime", start.get("date", ""))
@@ -109,6 +114,49 @@ def format_events_for_day(events, date: datetime):
                 day_events.append(ev)
     return day_events
 
+# ── 30-Min Reminders ─────────────────────────────────────────────────────────────
+def check_upcoming_reminders(state):
+    now = datetime.now(TZ)
+    window_end = now + timedelta(minutes=REMINDER_MINUTES_BEFORE + 5)
+    events = fetch_events(now, window_end)
+    if not events:
+        return
+
+    reminded = set(state.get("reminded_events", []))
+
+    for ev in events:
+        start = ev.get("start", {})
+        dt_str = start.get("dateTime")
+        if not dt_str:
+            continue  # skip all-day events
+
+        ev_start = datetime.fromisoformat(dt_str).astimezone(TZ)
+        mins_until = (ev_start - now).total_seconds() / 60
+
+        if not (0 < mins_until <= REMINDER_MINUTES_BEFORE):
+            continue
+
+        key = ev.get("id", "") + dt_str
+        if key in reminded:
+            continue
+
+        title = ev.get("summary", "(No title)")
+        cal = ev.get("_calendar", "")
+        time_str = ev_start.strftime("%I:%M %p")
+
+        msg = (
+            f"⏰ *Reminder — starting in {int(mins_until)} mins!*\n\n"
+            f"📌 {title}\n"
+            f"🕐 {time_str} [{cal}]"
+        )
+        send_message(ALLOWED_CHAT_ID, msg)
+        reminded.add(key)
+        print(f"[{now_str()}] 🔔 Reminder sent: {title}")
+
+    # Keep only last 200 reminder keys to avoid unbounded growth
+    state["reminded_events"] = list(reminded)[-200:]
+    save_state(state)
+
 # ── Command handlers ────────────────────────────────────────────────────────────
 def cmd_today():
     now = datetime.now(TZ)
@@ -117,7 +165,7 @@ def cmd_today():
     events = fetch_events(tmin, tmax)
 
     if events is None:
-        return "⚠️ Google Calendar not connected yet. Run the setup first."
+        return "⚠️ Google Calendar not connected yet."
 
     label = now.strftime("%A, %d %b %Y")
     if not events:
@@ -137,7 +185,7 @@ def cmd_tomorrow():
     events = fetch_events(tmin, tmax)
 
     if events is None:
-        return "⚠️ Google Calendar not connected yet. Run the setup first."
+        return "⚠️ Google Calendar not connected yet."
 
     label = tmr.strftime("%A, %d %b %Y")
     if not events:
@@ -151,14 +199,13 @@ def cmd_tomorrow():
 
 def cmd_this_week():
     now  = datetime.now(TZ)
-    # Monday of this week
     mon  = now - timedelta(days=now.weekday())
     tmin = mon.replace(hour=0, minute=0, second=0, microsecond=0)
     tmax = (mon + timedelta(days=6)).replace(hour=23, minute=59, second=59)
     events = fetch_events(tmin, tmax)
 
     if events is None:
-        return "⚠️ Google Calendar not connected yet. Run the setup first."
+        return "⚠️ Google Calendar not connected yet."
 
     week_label = f"{mon.strftime('%d %b')} – {(mon + timedelta(days=6)).strftime('%d %b %Y')}"
     lines = [f"🗓 *This Week — {week_label}*\n"]
@@ -188,7 +235,7 @@ def cmd_next_week():
     events = fetch_events(tmin, tmax)
 
     if events is None:
-        return "⚠️ Google Calendar not connected yet. Run the setup first."
+        return "⚠️ Google Calendar not connected yet."
 
     week_label = f"{mon.strftime('%d %b')} – {(mon + timedelta(days=6)).strftime('%d %b %Y')}"
     lines = [f"🗓 *Next Week — {week_label}*\n"]
@@ -218,7 +265,8 @@ def cmd_help():
         "• /eventtmr — tomorrow's events\n"
         "• /eventweek — this week\n"
         "• /eventnextweek — next week\n"
-        "• /help — show this menu"
+        "• /help — show this menu\n\n"
+        "🔔 Auto-reminders 30 mins before every event"
     )
 
 COMMANDS = {
@@ -270,8 +318,11 @@ def send_typing(chat_id):
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"last_update_id": 0}
+            s = json.load(f)
+            if "reminded_events" not in s:
+                s["reminded_events"] = []
+            return s
+    return {"last_update_id": 0, "reminded_events": []}
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
@@ -280,18 +331,73 @@ def save_state(state):
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+# ── Calendly Webhook ─────────────────────────────────────────────────────────────
+flask_app = Flask(__name__)
+
+@flask_app.route("/calendly-webhook", methods=["POST"])
+def calendly_webhook():
+    data = flask_request.json
+    if not data:
+        return "ok", 200
+
+    event_type = data.get("event", "")
+    payload = data.get("payload", {})
+
+    if event_type == "invitee.created":
+        name = payload.get("name", "Someone")
+        email = payload.get("email", "")
+        scheduled_event = payload.get("scheduled_event", {})
+        start = scheduled_event.get("start_time", "")
+        event_name = scheduled_event.get("name", "Meeting")
+        location = (
+            scheduled_event.get("location", {}).get("join_url") or
+            scheduled_event.get("location", {}).get("location", "TBD")
+        )
+
+        if start:
+            start_dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(TZ)
+            start_str = start_dt.strftime("%a, %d %b %Y at %I:%M %p")
+        else:
+            start_str = "TBD"
+
+        msg = (
+            f"📅 *New Calendly Booking!*\n\n"
+            f"👤 {name} ({email})\n"
+            f"📌 {event_name}\n"
+            f"🕐 {start_str}\n"
+            f"📍 {location}"
+        )
+        send_message(ALLOWED_CHAT_ID, msg)
+        print(f"[{now_str()}] 📅 Calendly booking from {name}")
+
+    return "ok", 200
+
+@flask_app.route("/", methods=["GET"])
+def health():
+    return "Pang's Daily Assistant is running!", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port)
+
 # ── Main ────────────────────────────────────────────────────────────────────────
 def main():
-    print(f"[{now_str()}] 🤖 Pang's Daily Assistant (keyword mode) starting...")
+    print(f"[{now_str()}] 🤖 Pang's Daily Assistant starting...")
 
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
         print(f"[{now_str()}] ⚠️  Service account file missing: {SERVICE_ACCOUNT_FILE}")
     else:
         print(f"[{now_str()}] ✅ Google Calendar service account found.")
 
+    # Start Flask webhook server in background thread
+    threading.Thread(target=run_flask, daemon=True).start()
+    print(f"[{now_str()}] ✅ Calendly webhook server started.")
+
     state  = load_state()
     offset = state["last_update_id"] + 1 if state["last_update_id"] else 0
     print(f"[{now_str()}] ✅ Polling for messages...")
+
+    last_reminder_check = 0
 
     while True:
         updates = get_updates(offset)
@@ -312,7 +418,6 @@ def main():
 
             print(f"[{now_str()}] 📨 {user_name}: {text}")
 
-            # Match command (strip @botname suffix if present)
             cmd = text.split("@")[0]
             handler = COMMANDS.get(cmd)
 
@@ -325,6 +430,11 @@ def main():
                 send_message(chat_id, "❓ Unknown command. Send /help to see available commands.")
 
             save_state(state)
+
+        # Check for upcoming events every 5 minutes
+        if time.time() - last_reminder_check >= REMINDER_CHECK_INTERVAL:
+            check_upcoming_reminders(state)
+            last_reminder_check = time.time()
 
         time.sleep(POLL_INTERVAL)
 
