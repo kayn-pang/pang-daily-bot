@@ -20,7 +20,7 @@ from googleapiclient.discovery import build
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
 # ── Configuration ───────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN  = "8619088376:AAH2uEBm-TuAglS1XBrUvGMvo8q0g9YLP_Y"
+TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "8619088376:AAH2uEBm-TuAglS1XBrUvGMvo8q0g9YLP_Y")
 ALLOWED_CHAT_ID = 1527866122
 TELEGRAM_API    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 POLL_INTERVAL   = 2
@@ -83,8 +83,8 @@ def fetch_events(time_min: datetime, time_max: datetime):
             for ev in result.get("items", []):
                 ev["_calendar"] = CALENDAR_NAMES.get(cal_id, cal_id)
                 all_events.append(ev)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[{now_str()}] ⚠️ Calendar error ({cal_id[:20]}): {e}")
 
     def sort_key(e):
         start = e.get("start", {})
@@ -102,17 +102,6 @@ def format_event(ev):
         t = "All day"
     title = ev.get("summary", "(No title)")
     return f"• {t} — {title}"
-
-def format_events_for_day(events, date: datetime):
-    day_events = []
-    for ev in events:
-        start = ev.get("start", {})
-        dt_str = start.get("dateTime") or start.get("date", "")
-        if dt_str:
-            ev_date = datetime.fromisoformat(dt_str).date() if "T" in dt_str else datetime.fromisoformat(dt_str).date()
-            if ev_date == date.date():
-                day_events.append(ev)
-    return day_events
 
 # ── 30-Min Reminders ─────────────────────────────────────────────────────────────
 def check_upcoming_reminders(state):
