@@ -372,6 +372,18 @@ def calendly_webhook():
 
     return "ok", 200
 
+@flask_app.route("/trigger-daily", methods=["GET", "POST"])
+def trigger_daily():
+    msg = cmd_today()
+    send_message(ALLOWED_CHAT_ID, msg)
+    return "ok", 200
+
+@flask_app.route("/trigger-weekly", methods=["GET", "POST"])
+def trigger_weekly():
+    msg = cmd_this_week()
+    send_message(ALLOWED_CHAT_ID, msg)
+    return "ok", 200
+
 @flask_app.route("/", methods=["GET"])
 def health():
     return "Pang's Daily Assistant is running!", 200
